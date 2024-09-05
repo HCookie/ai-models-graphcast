@@ -12,9 +12,11 @@ import functools
 import gc
 import logging
 import os
+import math
 from functools import cached_property
 
 import xarray
+import numpy as np
 from ai_models.model import Model
 
 from .input import create_training_xarray
@@ -81,6 +83,7 @@ class GraphcastModel(Model):
     ]
 
     use_an = False
+    max_hours_per_step = -1
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -236,16 +239,50 @@ class GraphcastModel(Model):
                 input_xr.to_netcdf("input_xr.nc")
                 forcings.to_netcdf("forcings_xr.nc")
 
-        with self.timer("Doing full rollout prediction in JAX"):
-            output = self.model(
-                rng=jax.random.PRNGKey(0),
-                inputs=input_xr,
-                targets_template=template,
-                forcings=forcings,
-            )
+        if self.max_hours_per_step <= -1:
+            with self.timer("Doing full rollout prediction in JAX"):
+                output = self.model(
+                    rng=jax.random.PRNGKey(0),
+                    inputs=input_xr,
+                    targets_template=template,
+                    forcings=forcings,
+                )
 
-            if self.debug:
-                output.to_netcdf("output.nc")
+                if self.debug:
+                    output.to_netcdf("output.nc")
+        else:
+            with self.timer(f"Doing full rollout prediction in chunks of size {self.max_hours_per_step}"):
+
+                num_total_steps = math.ceil(self.lead_time / self.max_hours_per_step)
+
+                max_time_value = self.lead_time // self.hour_steps
+                outputs = []
+
+                for i in range(num_total_steps):
+                    def hour_index(val):
+                        return (val * self.max_hours_per_step) // self.hour_steps
+                    
+                    def subset_and_adjust(ds, name):
+                        ds_subset = ds.isel(time = slice(hour_index(i), min(hour_index(i+1), max_time_value)))
+                        ds_subset['time'] = ds_subset.time - np.timedelta64(self.max_hours_per_step * i, 'h')
+                        return ds_subset
+
+                    prediction = self.model(
+                            rng=jax.random.PRNGKey(0),
+                            inputs=input_xr,
+                            targets_template=subset_and_adjust(template, 'template'),
+                            forcings=subset_and_adjust(forcings, 'forcings'),
+                        )
+                    prediction['time'] = prediction.time + np.timedelta64(i * self.max_hours_per_step, 'h')
+                    outputs.append(prediction)
+
+                    input_xr = outputs[-1].isel(time = slice(-1 * len(self.lagged), None))
+                    input_xr['time'] = input_xr.time
+                    input_xr = xarray.merge((input_xr, forcings.sel(time = input_xr.time)))
+
+
+                output = xarray.combine_by_coords(outputs)
+
 
         with self.timer("Saving output data"):
             save_output_xarray(
@@ -289,6 +326,7 @@ class GraphcastModel(Model):
         parser = argparse.ArgumentParser("ai-models graphcast")
         parser.add_argument("--use-an", action="store_true")
         parser.add_argument("--override-constants")
+        parser.add_argument('--max-hours-per-step', type=int, default=-1)
         return parser.parse_args(args)
 
 
